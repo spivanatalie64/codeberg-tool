@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""
+berg — CLI for Codeberg (Forgejo/Gitea)
+A lightweight tool to interact with Codeberg and any Forgejo/Gitea instance.
+"""
+
+import os
+import sys
+import json
+import yaml
+import requests
+from pathlib import Path
+from rich import print as rprint
+from rich.table import Table
+from rich.syntax import Syntax
+import click
+
+# ── Config ──────────────────────────────────────────────────────────────
+CONFIG_DIR = Path.home() / ".config" / "berg"
+CONFIG_FILE = CONFIG_DIR / "config.yml"
+DEFAULT_HOST = "codeberg.org"
+API_BASE = "https://{host}/api/v1"
+
+def load_config():
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False)
+    CONFIG_FILE.chmod(0o600)
+
+def get_api(host=None):
+    cfg = load_config()
+    host = host or cfg.get("host", DEFAULT_HOST)
+    token = cfg.get("token")
+    if not token:
+        rprint("[bold red]✗[/] Not authenticated. Run [bold]berg auth[/] first.")
+        sys.exit(1)
+    base = API_BASE.format(host=host)
+    sess = requests.Session()
+    sess.headers.update({"Authorization": f"token {token}", "User-Agent": "berg/1.0"})
+    return sess, base, host
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────
+@click.group()
+def cli():
+    """berg — CLI for Codeberg (Forgejo/Gitea)"""
+    pass
+
+
+# ── auth ────────────────────────────────────────────────────────────────
+@cli.command()
+@click.option("--host", default=DEFAULT_HOST, help="Forgejo/Gitea host")
+@click.option("--token", envvar="BERG_TOKEN", help="API token (or pass via BERG_TOKEN env)")
+@click.option("--check", is_flag=True, help="Check current auth status")
+def auth(host, token, check):
+    """Authenticate with Codeberg/Forgejo"""
+    cfg = load_config()
+
+    if check:
+        if cfg.get("token"):
+            rprint(f"[green]✓[/] Authenticated as [bold]{cfg.get('user', '?')}[/] on [bold]{cfg.get('host', host)}[/]")
+        else:
+            rprint("[yellow]![/] No token configured. Run [bold]berg auth --token <token>[/]")
+        return
+
+    if not token:
+        token = click.prompt("API token", hide_input=True)
+
+    # Test the token
+    sess = requests.Session()
+    sess.headers.update({"Authorization": f"token {token}", "User-Agent": "berg/1.0"})
+    base = API_BASE.format(host=host)
+
+    try:
+        resp = sess.get(f"{base}/user")
+        resp.raise_for_status()
+        user = resp.json()
+    except requests.RequestException as e:
+        rprint(f"[bold red]✗[/] Authentication failed: {e}")
+        sys.exit(1)
+
+    cfg["token"] = token
+    cfg["host"] = host
+    cfg["user"] = user.get("login")
+    save_config(cfg)
+
+    rprint(f"[green]✓[/] Authenticated as [bold]{user['login']}[/] on [bold]{host}[/]")
+    rprint(f"   Config: {CONFIG_FILE}")
+
+
+# ── whoami ──────────────────────────────────────────────────────────────
+@cli.command()
+def whoami():
+    """Show current user info"""
+    sess, base, host = get_api()
+    resp = sess.get(f"{base}/user")
+    resp.raise_for_status()
+    user = resp.json()
+    rprint(f"[bold]{user['login']}[/] <{user.get('email', 'no email')}> on [bold]{host}[/]")
+
+
+# ── repo list ───────────────────────────────────────────────────────────
+@cli.group()
+def repo():
+    """Manage repositories"""
+    pass
+
+@repo.command("list")
+@click.option("--all", "all_repos", is_flag=True, help="Show all repos (not just yours)")
+def repo_list(all_repos):
+    """List your repositories"""
+    sess, base, host = get_api()
+    page = 1
+    repos = []
+    while True:
+        url = f"{base}/user/repos?page={page}&limit=50"
+        resp = sess.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            break
+        repos.extend(data)
+        page += 1
+
+    if not repos:
+        rprint("[yellow]No repos found[/]")
+        return
+
+    table = Table(title=f"Repos on {host}")
+    table.add_column("Name", style="cyan")
+    table.add_column("Visibility", style="yellow")
+    table.add_column("Description", max_width=60)
+    for r in repos:
+        table.add_row(
+            r["full_name"] or r["name"],
+            "public" if r.get("visibility") == "public" or not r.get("private") else "private",
+            (r.get("description") or "")[:60],
+        )
+    rprint(table)
+
+
+# ── repo create ─────────────────────────────────────────────────────────
+@repo.command("create")
+@click.argument("name")
+@click.option("--description", "-d", default="", help="Repo description")
+@click.option("--private", is_flag=True, help="Make repo private")
+@click.option("--auto-init", is_flag=True, help="Initialize with README")
+def repo_create(name, description, private, auto_init):
+    """Create a new repository"""
+    sess, base, host = get_api()
+    payload = {
+        "name": name,
+        "description": description,
+        "private": private,
+        "auto_init": auto_init,
+        "default_branch": "main",
+    }
+    resp = sess.post(f"{base}/user/repos", json=payload)
+    if resp.status_code == 201:
+        rprint(f"[green]✓[/] Created [bold]{name}[/] on [bold]{host}[/]")
+        data = resp.json()
+        rprint(f"   Clone: {data.get('clone_url', '?')}")
+    else:
+        rprint(f"[bold red]✗[/] Failed: {resp.status_code} {resp.text}")
+        sys.exit(1)
+
+
+# ── repo fork ───────────────────────────────────────────────────────────
+@repo.command("fork")
+@click.argument("repo")
+@click.option("--name", help="New repo name (default: same as original)")
+@click.option("--organization", help="Organization to fork to")
+def repo_fork(repo, name, organization):
+    """Fork a repository"""
+    sess, base, host = get_api()
+    payload = {}
+    if name:
+        payload["name"] = name
+    if organization:
+        payload["organization"] = organization
+
+    resp = sess.post(f"{base}/repos/{repo}/forks", json=payload)
+    if resp.status_code == 202:
+        rprint(f"[green]✓[/] Forked [bold]{repo}[/]")
+        data = resp.json()
+        rprint(f"   → {data.get('clone_url', '?')}")
+    elif resp.status_code == 409:
+        rprint("[yellow]![/] Fork already exists (409 Conflict)")
+        # Try to get existing fork
+        owner = organization or load_config().get("user")
+        if owner:
+            rprint(f"   → https://{host}/{owner}/{name or repo.split('/')[-1]}")
+    else:
+        rprint(f"[bold red]✗[/] Failed: {resp.status_code} {resp.text}")
+        sys.exit(1)
+
+
+# ── repo get ────────────────────────────────────────────────────────────
+@repo.command("get")
+@click.argument("repo")
+def repo_get(repo):
+    """Show repository details"""
+    sess, base, host = get_api()
+    resp = sess.get(f"{base}/repos/{repo}")
+    if resp.status_code != 200:
+        rprint(f"[bold red]✗[/] Repo not found: {repo}")
+        sys.exit(1)
+    r = resp.json()
+    rprint(f"[bold cyan]{r['full_name']}[/]")
+    rprint(f"   Description: {r.get('description', 'N/A')}")
+    rprint(f"   Visibility:  {'public' if not r.get('private') else 'private'}")
+    rprint(f"   Clone URL:   {r.get('clone_url', '?')}")
+    rprint(f"   SSH URL:     {r.get('ssh_url', '?')}")
+    rprint(f"   Stars:       {r.get('stars_count', 0)}")
+    rprint(f"   Forks:       {r.get('forks_count', 0)}")
+    if r.get("parent"):
+        rprint(f"   Forked from: {r['parent']['full_name']}")
+
+
+# ── push ────────────────────────────────────────────────────────────────
+@cli.command()
+@click.argument("remote_name", default="codeberg")
+@click.option("--repo", help="Repo name (default: current directory name)")
+@click.option("--owner", help="Owner/org (default: your username)")
+@click.option("--ssh", is_flag=True, help="Use SSH URL instead of HTTPS")
+def push(remote_name, repo, owner, ssh):
+    """Set up Codeberg remote and push current repo"""
+    import subprocess
+
+    cfg = load_config()
+    owner = owner or cfg.get("user")
+    if not owner:
+        rprint("[bold red]✗[/] No owner specified and no user configured. Run [bold]berg auth[/] first.")
+        sys.exit(1)
+
+    repo = repo or Path.cwd().name
+    sess, base, host = get_api()
+
+    # Check if repo exists on remote, create if not
+    check = sess.get(f"{base}/repos/{owner}/{repo}")
+    if check.status_code == 404:
+        click.confirm(f"Repo [bold]{owner}/{repo}[/] doesn't exist on {host}. Create it?", default=True, abort=True)
+        payload = {"name": repo, "auto_init": False, "private": False}
+        resp = sess.post(f"{base}/user/repos", json=payload)
+        if resp.status_code != 201:
+            rprint(f"[bold red]✗[/] Failed to create repo: {resp.status_code} {resp.text}")
+            sys.exit(1)
+        rprint(f"[green]✓[/] Created [bold]{owner}/{repo}[/] on {host}")
+
+    # Set remote URL
+    if ssh:
+        remote_url = f"git@{host}:{owner}/{repo}.git"
+    else:
+        remote_url = f"https://{host}/{owner}/{repo}.git"
+
+    result = subprocess.run(
+        ["git", "remote", "set-url", remote_name, remote_url] if sys.platform != "win32" else
+        ["git", "remote", "set-url", remote_name, remote_url],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        # Remote doesn't exist, add it
+        result = subprocess.run(["git", "remote", "add", remote_name, remote_url],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            rprint(f"[bold red]✗[/] Failed to set remote: {result.stderr}")
+            sys.exit(1)
+
+    rprint(f"[green]✓[/] Remote [bold]{remote_name}[/] set to {remote_url}")
+
+    # Push
+    result = subprocess.run(["git", "push", "-u", remote_name, "main"],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
+        rprint(f"[green]✓[/] Pushed to [bold]{host}/{owner}/{repo}[/]")
+    else:
+        # Try pushing all branches
+        rprint(f"[yellow]![/] Main push said: {result.stderr.strip()}")
+        result = subprocess.run(["git", "push", "-u", remote_name, "--all"],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            rprint(f"[green]✓[/] Pushed all branches to [bold]{host}/{owner}/{repo}[/]")
+        else:
+            rprint(f"[bold red]✗[/] Push failed: {result.stderr}")
+            sys.exit(1)
+
+
+# ── config path ─────────────────────────────────────────────────────────
+@cli.command()
+def config():
+    """Show config file path and contents"""
+    if CONFIG_FILE.exists():
+        rprint(f"[bold]Config file:[/] {CONFIG_FILE}")
+        with open(CONFIG_FILE) as f:
+            content = f.read()
+        if content.strip():
+            syntax = Syntax(content, "yaml", theme="ansi_dark")
+            rprint(syntax)
+        else:
+            rprint("[yellow]Config file is empty[/]")
+    else:
+        rprint(f"[yellow]No config file at {CONFIG_FILE}[/]")
+
+
+# ── Enter ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    cli()
